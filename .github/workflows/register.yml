@@ -63,7 +63,7 @@ jobs:
           PROXY_GATEWAY: ${{ secrets.PROXY_GATEWAY || 'socks5://127.0.0.1:40000' }}
           MAX_ROUNDS: ${{ github.event.inputs.rounds || '2' }}
           MAX_DAILY_TOTAL: '10'
-          DELAY_MINUTES: '10'
+          DELAY_MINUTES: '0'
         run: python github_action_runner.py
 
       - name: Upload results

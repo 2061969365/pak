@@ -58,6 +58,47 @@ def _save_counter(count):
         json.dump(data, f)
 
 
+def _get_current_warp_ip():
+    """Get current exit IP through WARP SOCKS5 proxy"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['curl', '-s', '--connect-timeout', '5',
+             '--socks5-hostname', '127.0.0.1:40000',
+             'https://ifconfig.me'],
+            capture_output=True, text=True, timeout=10)
+        ip = result.stdout.strip()
+        if ip and '.' in ip:
+            return ip
+    except Exception:
+        pass
+    return None
+
+def _rotate_warp_ip():
+    """Disconnect and reconnect WARP until IP actually changes"""
+    import subprocess
+    old_ip = _get_current_warp_ip()
+    print('  Current IP: ' + (old_ip or 'unknown'))
+
+    for attempt in range(5):
+        print('  Rotating WARP... (' + str(attempt + 1) + '/5)', end=' ')
+        subprocess.run(['sudo', 'warp-cli', '--accept-tos', 'disconnect'],
+                       capture_output=True, timeout=10)
+        time.sleep(2)
+        subprocess.run(['sudo', 'warp-cli', '--accept-tos', 'connect'],
+                       capture_output=True, timeout=10)
+        time.sleep(4)
+
+        new_ip = _get_current_warp_ip()
+        if new_ip and new_ip != old_ip:
+            print('IP changed: ' + old_ip + ' -> ' + new_ip)
+            return True
+        print('same IP, retrying...')
+
+    print('  WARNING: Could not change IP after 5 attempts')
+    return False
+
+
 def load_config():
     invite_link = os.environ.get('INVITE_LINK', '').strip()
     if not invite_link:
@@ -176,13 +217,9 @@ def main():
             break
 
         if round_num < batch_size:
-            wait_secs = cfg['delay_minutes'] * 60
             print()
-            print('Waiting ' + str(cfg['delay_minutes']) + ' min...')
-            for i in range(wait_secs):
-                if i % 30 == 0 and i > 0:
-                    print('  ...remaining ' + str(wait_secs - i) + 's')
-                time.sleep(1)
+            print('Rotating IP for next account...')
+            _rotate_warp_ip()
 
     print()
     print('=' * 60)
