@@ -39,27 +39,11 @@ jobs:
       - name: Install Node.js deps
         run: npm install
 
-      - name: Install & Start Cloudflare WARP
-        run: |
-          # Get Ubuntu codename
-          . /etc/os-release
-          echo "OS: $ID $VERSION_CODENAME"
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $VERSION_CODENAME main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-          sudo nohup warp-svc --accept-tos > /tmp/warp-svc.log 2>&1 &
-          sleep 5
-          warp-cli --accept-tos registration new
-          warp-cli --accept-tos set-mode warp+doh
-          warp-cli --accept-tos connect
-          sleep 10
-          echo "WARP IP: $(curl -s ifconfig.me)"
-
       - name: Run registration
         id: run
         env:
           INVITE_LINK: ${{ secrets.PIKPAK_INVITE_LINK }}
-          PROXY_GATEWAY: ''
+          PROXY_GATEWAY: ${{ secrets.PROXY_GATEWAY }}
           MAX_ROUNDS: ${{ github.event.inputs.rounds || '2' }}
           MAX_DAILY_TOTAL: '10'
           DELAY_MINUTES: '10'
