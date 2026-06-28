@@ -1,0 +1,81 @@
+name: PikPak Auto Register
+
+on:
+  schedule:
+    - cron: '0 0,4,8,12,16,20 * * *'
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Accounts to register this run
+        required: false
+        default: '2'
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: 'true'
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node.js deps
+        run: npm install
+
+      - name: Install & Start Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/  main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+          sudo nohup warp-svc --accept-tos > /tmp/warp-svc.log 2>&1 &
+          sleep 5
+          warp-cli --accept-tos register
+          warp-cli --accept-tos set-mode warp+doh
+          warp-cli --accept-tos connect
+          sleep 10
+          echo "WARP IP: 219.136.106.1"
+
+      - name: Run registration
+        id: run
+        env:
+          INVITE_LINK: ${{ secrets.PIKPAK_INVITE_LINK }}
+          PROXY_GATEWAY: ''
+          MAX_ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+          MAX_DAILY_TOTAL: '10'
+          DELAY_MINUTES: '10'
+        run: python github_action_runner.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-results
+          path: |
+            batch_result_protocol.txt
+            debug.log
+          retention-days: 30
+
+      - name: Upload daily counter
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-counter
+          path: /tmp/pikpak_counter.json
+          retention-days: 1

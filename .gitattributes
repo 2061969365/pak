@@ -1,0 +1,6 @@
+YOLO5/best.onnx filter=lfs diff=lfs merge=lfs -text
+YOLO5/best.onnx.data filter=lfs diff=lfs merge=lfs -text
+Siamese/IconCompare.onnx filter=lfs diff=lfs merge=lfs -text
+Siamese/IconCompare.onnx.data filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.onnx.data filter=lfs diff=lfs merge=lfs -text

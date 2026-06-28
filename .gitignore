@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+gui_config.json
+*.log
+*.txt
+!requirements.txt
+node_modules/
+.trae/
+.vscode/

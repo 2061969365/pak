@@ -1,0 +1,664 @@
+import random
+import re
+import string
+import time
+
+from .http_client import make_request
+
+_MAILTM_PROVIDERS = [
+    "https://api.mail.tm",
+    "https://api.mail.gw",
+]
+
+_GUERRILLA_URL = "https://api.guerrillamail.com"
+
+_GUERRILLA_DOMAINS = [
+    "guerrillamail.com",
+    "guerrillamailblock.com",
+    "sharklasers.com",
+]
+
+_1SECMAIL_URL = "https://www.1secmail.com"
+_1SECMAIL_DOMAINS_CACHE = None
+_1SECMAIL_DOMAINS_CACHE_TIME = 0
+
+_TEMPMĀILIO_URL = "https://api.internal.temp-mail.io"
+_TEMPMĀILIO_DOMAINS_CACHE = None
+_TEMPMĀILIO_DOMAINS_CACHE_TIME = 0
+
+_FORCE_DOMAIN = None
+
+_FALLBACK_DOMAINS = [
+    "oakon.com", "teihu.com", "raleigh-construction.com",
+    "pastryofistanbul.com", "questtechsystems.com",
+]
+
+
+def _get_tempmailio_domains():
+    global _TEMPMĀILIO_DOMAINS_CACHE, _TEMPMĀILIO_DOMAINS_CACHE_TIME
+    now = time.time()
+    if _TEMPMĀILIO_DOMAINS_CACHE and (now - _TEMPMĀILIO_DOMAINS_CACHE_TIME) < 600:
+        return _TEMPMĀILIO_DOMAINS_CACHE
+    try:
+        resp = make_request("GET", _TEMPMĀILIO_URL, "/api/v2/domains",
+                            headers={"Accept": "application/json"},
+                            timeout=30, use_proxy=False)
+        data = _safe_data(resp)
+        domains = data.get("domains", []) if isinstance(data, dict) else []
+        _TEMPMĀILIO_DOMAINS_CACHE = domains
+        _TEMPMĀILIO_DOMAINS_CACHE_TIME = now
+        return domains
+    except Exception:
+        if _TEMPMĀILIO_DOMAINS_CACHE:
+            return _TEMPMĀILIO_DOMAINS_CACHE
+        return []
+
+
+def _get_1secmail_domains():
+    global _1SECMAIL_DOMAINS_CACHE, _1SECMAIL_DOMAINS_CACHE_TIME
+    now = time.time()
+    if _1SECMAIL_DOMAINS_CACHE and (now - _1SECMAIL_DOMAINS_CACHE_TIME) < 600:
+        return _1SECMAIL_DOMAINS_CACHE
+    try:
+        resp = make_request("GET", _1SECMAIL_URL, "/api/v1/",
+                            params={"action": "getDomainList"},
+                            headers={"Accept": "application/json"},
+                            timeout=15, use_proxy=True)
+        data = _safe_data(resp)
+        if isinstance(data, list):
+            domains = [d for d in data if isinstance(d, str) and d.endswith(".com")]
+            _1SECMAIL_DOMAINS_CACHE = domains
+            _1SECMAIL_DOMAINS_CACHE_TIME = now
+            return domains
+    except Exception:
+        pass
+    if _1SECMAIL_DOMAINS_CACHE:
+        return _1SECMAIL_DOMAINS_CACHE
+    return []
+
+
+def get_available_domains():
+    domains = set()
+
+    for base_url in _MAILTM_PROVIDERS:
+        try:
+            resp = make_request("GET", base_url, "/domains",
+                                headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+                                timeout=15, use_proxy=True)
+            data = _safe_data(resp)
+            if isinstance(data, list):
+                for d in data:
+                    if isinstance(d, dict) and d.get("isActive") and d["domain"].endswith(".com"):
+                        domains.add(d["domain"])
+        except Exception:
+            continue
+
+    domains.update(d for d in _GUERRILLA_DOMAINS if d.endswith(".com"))
+
+    try:
+        tempmailio_domains = _get_tempmailio_domains()
+        domains.update(d for d in tempmailio_domains if d.endswith(".com"))
+    except Exception:
+        pass
+
+    try:
+        secmail_domains = _get_1secmail_domains()
+        domains.update(d for d in secmail_domains if d.endswith(".com"))
+    except Exception:
+        pass
+
+    if domains:
+        return sorted(domains)
+    return sorted(d for d in _FALLBACK_DOMAINS if d.endswith(".com"))
+
+
+def _get_domains_for_provider(base_url):
+    resp = make_request("GET", base_url, "/domains",
+                        headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+                        timeout=15, use_proxy=True)
+    data = _safe_data(resp)
+    if not isinstance(data, list):
+        return []
+    return [d["domain"] for d in data if isinstance(d, dict) and d.get("isActive") and d["domain"].endswith(".com")]
+
+
+def _try_create_mailtm(base_url, local, password, domain):
+    email = f"{local}@{domain}"
+    resp = make_request("POST", base_url, "/accounts", headers={
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }, body={"address": email, "password": password}, timeout=15, use_proxy=True)
+    data = _safe_data(resp)
+    if isinstance(data, dict) and resp["status_code"] == 201 and data.get("id"):
+        token_resp = make_request("POST", base_url, "/token", headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }, body={"address": email, "password": password}, timeout=15, use_proxy=True)
+        token_data = _safe_data(token_resp)
+        token = token_data.get("token") if isinstance(token_data, dict) else None
+        if not token:
+            raise RuntimeError(f"获取token失败: {token_resp['data']}")
+        return {"email": email, "token": token, "base_url": base_url, "type": "mailtm"}
+    return None
+
+
+def _try_create_guerrilla(force_domain=None):
+    import requests
+    from .http_client import get_proxy_dict, force_rotate_proxy
+
+    params = {"f": "get_email_address", "_": str(int(time.time() * 1000))}
+    last_error = None
+    for attempt in range(3):
+        proxies = get_proxy_dict()
+        try:
+            resp = requests.get(
+                _GUERRILLA_URL + "/ajax.php",
+                params=params,
+                headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+                timeout=15,
+                proxies=proxies,
+            )
+            break
+        except requests.exceptions.SSLError as e:
+            last_error = e
+            force_rotate_proxy()
+            if attempt < 2:
+                time.sleep(2)
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            err_str = str(e).lower()
+            if 'ssl' in err_str or 'wrong_version' in err_str:
+                force_rotate_proxy()
+            if attempt < 2:
+                time.sleep(2)
+    else:
+        try:
+            resp = requests.get(
+                _GUERRILLA_URL + "/ajax.php",
+                params=params,
+                headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+                timeout=15,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Guerrilla Mail创建失败(所有重试耗尽): {e}")
+    data = _safe_json(resp)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Guerrilla Mail创建失败: {data}")
+    sid_token = data.get("sid_token")
+    if not sid_token:
+        raise RuntimeError(f"Guerrilla Mail创建失败: {data}")
+
+    if force_domain:
+        local_part = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        set_params = {
+            "f": "set_email_user",
+            "email_user": local_part,
+            "lang": "en",
+            "site": force_domain,
+            "sid_token": sid_token,
+        }
+        try:
+            set_resp = requests.get(
+                _GUERRILLA_URL + "/ajax.php",
+                params=set_params,
+                headers={"Accept": "application/json"},
+                timeout=15,
+                proxies=get_proxy_dict(),
+            )
+            set_data = _safe_json(set_resp)
+            if isinstance(set_data, dict) and set_data.get("email_addr"):
+                return {"email": set_data["email_addr"], "token": sid_token,
+                        "base_url": _GUERRILLA_URL, "type": "guerrilla"}
+        except Exception:
+            pass
+
+    email = data.get("email_addr")
+    if not email:
+        raise RuntimeError(f"Guerrilla Mail创建失败: {data}")
+    return {"email": email, "token": sid_token, "base_url": _GUERRILLA_URL, "type": "guerrilla"}
+
+
+def _try_create_tempmailio(local, domain):
+    import requests
+
+    resp = requests.post(
+        _TEMPMĀILIO_URL + "/api/v2/email/new",
+        json={"local_part": local, "domain": domain},
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    data = _safe_json(resp)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Temp-Mail创建失败: {data}")
+    email = data.get("email")
+    token = data.get("token")
+    if not email or not token:
+        raise RuntimeError(f"Temp-Mail创建失败: {data}")
+    return {"email": email, "token": email, "base_url": _TEMPMĀILIO_URL, "type": "tempmailio"}
+
+
+def _try_create_1secmail(force_domain=None):
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    domains = _get_1secmail_domains()
+    if not domains:
+        raise RuntimeError("1secmail域名获取失败")
+    domain = force_domain if (force_domain and force_domain in domains) else random.choice(domains)
+    email = f"{local}@{domain}"
+    login = local
+    return {
+        "email": email,
+        "token": f"{login}:{domain}",
+        "base_url": _1SECMAIL_URL,
+        "type": "1secmail",
+    }
+
+
+def create_mail_account(force_domain=None):
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    password = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+
+    is_guerrilla = force_domain and force_domain in _GUERRILLA_DOMAINS
+    is_1secmail = False
+    if force_domain and not is_guerrilla:
+        try:
+            secmail_domains = _get_1secmail_domains()
+            if force_domain in secmail_domains:
+                is_1secmail = True
+        except Exception:
+            pass
+
+    if force_domain and is_1secmail:
+        try:
+            return _try_create_1secmail(force_domain=force_domain)
+        except Exception:
+            pass
+
+    if force_domain and not is_guerrilla and not is_1secmail:
+        providers = list(_MAILTM_PROVIDERS)
+        random.shuffle(providers)
+        for base_url in providers:
+            try:
+                domains = _get_domains_for_provider(base_url)
+                if force_domain in domains:
+                    result = _try_create_mailtm(base_url, local, password, force_domain)
+                    if result:
+                        return result
+            except Exception:
+                continue
+        try:
+            tempmailio_domains = _get_tempmailio_domains()
+            if force_domain in tempmailio_domains:
+                result = _try_create_tempmailio(local, force_domain)
+                if result:
+                    return result
+        except Exception:
+            pass
+
+    if force_domain and is_guerrilla:
+        try:
+            return _try_create_guerrilla(force_domain=force_domain)
+        except Exception:
+            pass
+
+    candidates = []
+
+    for base_url in _MAILTM_PROVIDERS:
+        try:
+            domains = _get_domains_for_provider(base_url)
+            if domains:
+                candidates.append(("mailtm", base_url, domains))
+        except Exception:
+            continue
+
+    candidates.append(("guerrilla", _GUERRILLA_URL, _GUERRILLA_DOMAINS))
+
+    try:
+        tempmailio_domains = _get_tempmailio_domains()
+        if tempmailio_domains:
+            candidates.append(("tempmailio", _TEMPMĀILIO_URL, tempmailio_domains))
+    except Exception:
+        pass
+
+    try:
+        secmail_domains = _get_1secmail_domains()
+        if secmail_domains:
+            candidates.append(("1secmail", _1SECMAIL_URL, secmail_domains))
+    except Exception:
+        pass
+
+    random.shuffle(candidates)
+
+    for ptype, base_url, domains in candidates:
+        try:
+            if ptype == "mailtm":
+                domain = random.choice(domains)
+                result = _try_create_mailtm(base_url, local, password, domain)
+                if result:
+                    return result
+            elif ptype == "guerrilla":
+                chosen_domain = random.choice(domains)
+                return _try_create_guerrilla(force_domain=chosen_domain)
+            elif ptype == "tempmailio":
+                domain = random.choice(domains)
+                result = _try_create_tempmailio(local, domain)
+                if result:
+                    return result
+            elif ptype == "1secmail":
+                chosen_domain = random.choice(domains)
+                result = _try_create_1secmail(force_domain=chosen_domain)
+                if result:
+                    return result
+        except Exception:
+            continue
+
+    raise RuntimeError("所有邮箱服务商均不可用")
+
+
+def _safe_data(resp):
+    data = resp["data"]
+    if isinstance(data, str):
+        return {}
+    if isinstance(data, (dict, list)):
+        return data
+    return {}
+
+
+def _safe_json(resp):
+    try:
+        data = resp.json()
+    except Exception:
+        return {}
+    if isinstance(data, str):
+        return {}
+    if isinstance(data, (dict, list)):
+        return data
+    return {}
+
+
+def _find_code(value):
+    if not value:
+        return None
+    match = re.search(r"\b(\d{6})\b", str(value))
+    return match.group(1) if match else None
+
+
+def _fetch_code_mailtm(token, base_url, stop_check=None):
+    last_error = None
+    poll_count = 0
+
+    while True:
+        if stop_check and stop_check():
+            raise RuntimeError('用户停止')
+
+        poll_count += 1
+        try:
+            resp = make_request("GET", base_url, "/messages", headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            }, timeout=15, use_proxy=True)
+
+            messages = _safe_data(resp)
+            if isinstance(messages, dict):
+                messages = messages.get("hydra:member", [])
+            if not isinstance(messages, list):
+                messages = []
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                subject = msg.get("subject", "")
+                intro = msg.get("intro", "")
+                summary_code = _find_code(f"{subject} {intro}")
+                if summary_code:
+                    return summary_code
+
+                try:
+                    msg_id = msg.get("id")
+                    if not msg_id:
+                        continue
+                    detail = make_request(
+                        "GET", base_url, f"/messages/{msg_id}",
+                        headers={
+                            "Accept": "application/json",
+                            "Authorization": f"Bearer {token}",
+                        }, timeout=15, use_proxy=True,
+                    )
+                    detail_data = _safe_data(detail)
+                    body = detail_data.get("text", "") or detail_data.get("html", "")
+                    body_code = _find_code(body)
+                    if body_code:
+                        return body_code
+                except Exception as e:
+                    last_error = e
+
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: 已轮询{poll_count}次未收到验证码")
+            time.sleep(3)
+        except Exception as e:
+            last_error = e
+            time.sleep(5)
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: {last_error}")
+
+
+def _fetch_code_guerrilla(sid_token, stop_check=None):
+    import requests
+    from .http_client import get_proxy_dict, force_rotate_proxy
+
+    last_error = None
+    poll_count = 0
+    seen_ids = set()
+
+    def _guerrilla_get(params, timeout=15):
+        proxies = get_proxy_dict()
+        for attempt in range(3):
+            try:
+                return requests.get(
+                    _GUERRILLA_URL + "/ajax.php",
+                    params=params,
+                    headers={"Accept": "application/json"},
+                    timeout=timeout,
+                    proxies=proxies,
+                )
+            except requests.exceptions.SSLError:
+                force_rotate_proxy()
+                proxies = get_proxy_dict()
+                if attempt < 2:
+                    time.sleep(2)
+            except requests.exceptions.ConnectionError as e:
+                err_str = str(e).lower()
+                if 'ssl' in err_str or 'wrong_version' in err_str:
+                    force_rotate_proxy()
+                    proxies = get_proxy_dict()
+                if attempt < 2:
+                    time.sleep(2)
+        return requests.get(
+            _GUERRILLA_URL + "/ajax.php",
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+
+    while True:
+        if stop_check and stop_check():
+            raise RuntimeError('用户停止')
+
+        poll_count += 1
+        try:
+            resp = _guerrilla_get({"f": "check_email", "seq": 0, "sid_token": sid_token})
+            data = _safe_json(resp)
+            messages = data.get("list", []) if isinstance(data, dict) else []
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = msg.get("mail_id")
+                if msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+
+                subject = msg.get("mail_subject", "")
+                excerpt = msg.get("mail_excerpt", "")
+                summary_code = _find_code(f"{subject} {excerpt}")
+                if summary_code:
+                    return summary_code
+
+                body = msg.get("mail_body", "")
+                body_code = _find_code(body)
+                if body_code:
+                    return body_code
+
+                try:
+                    detail_resp = _guerrilla_get({"f": "fetch_email", "email_id": msg_id, "sid_token": sid_token})
+                    detail = _safe_json(detail_resp)
+                    full_body = detail.get("mail_body", "") if isinstance(detail, dict) else ""
+                    full_code = _find_code(full_body)
+                    if full_code:
+                        return full_code
+                except Exception as e:
+                    last_error = e
+
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: 已轮询{poll_count}次未收到验证码")
+            time.sleep(3)
+        except Exception as e:
+            last_error = e
+            time.sleep(5)
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: {last_error}")
+
+
+def _fetch_code_tempmailio(email, stop_check=None):
+    import requests
+    from .http_client import get_proxy_dict, force_rotate_proxy
+
+    last_error = None
+    poll_count = 0
+    seen_ids = set()
+
+    def _tempmailio_get(url, timeout=30):
+        for attempt in range(3):
+            try:
+                return requests.get(
+                    url,
+                    headers={"Accept": "application/json"},
+                    timeout=timeout,
+                )
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
+                if attempt < 2:
+                    time.sleep(2)
+        return requests.get(
+            url,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+
+    while True:
+        if stop_check and stop_check():
+            raise RuntimeError('用户停止')
+
+        poll_count += 1
+        try:
+            resp = _tempmailio_get(f"{_TEMPMĀILIO_URL}/api/v2/email/{email}/messages")
+            messages = _safe_json(resp)
+
+            if not isinstance(messages, list):
+                messages = []
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = msg.get("id")
+                if msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+
+                subject = msg.get("subject", "")
+                body_text = msg.get("body_text", "") or msg.get("body_html", "") or msg.get("body", "")
+                code = _find_code(f"{subject} {body_text}")
+                if code:
+                    return code
+
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: 已轮询{poll_count}次未收到验证码")
+            time.sleep(3)
+        except Exception as e:
+            last_error = e
+            time.sleep(5)
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: {last_error}")
+
+
+def _fetch_code_1secmail(token, stop_check=None):
+    parts = token.split(":", 1)
+    if len(parts) != 2:
+        raise RuntimeError(f"1secmail token格式错误: {token}")
+    login, domain = parts
+
+    poll_count = 0
+    seen_ids = set()
+
+    while True:
+        if stop_check and stop_check():
+            raise RuntimeError('用户停止')
+
+        poll_count += 1
+        try:
+            resp = make_request("GET", _1SECMAIL_URL, "/api/v1/",
+                                params={"action": "getMessages", "login": login, "domain": domain},
+                                headers={"Accept": "application/json"},
+                                timeout=15, use_proxy=True)
+            messages = _safe_data(resp)
+            if not isinstance(messages, list):
+                messages = []
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = msg.get("id")
+                if msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+
+                subject = msg.get("subject", "")
+                summary_code = _find_code(subject)
+                if summary_code:
+                    return summary_code
+
+                try:
+                    detail_resp = make_request("GET", _1SECMAIL_URL, "/api/v1/",
+                                               params={"action": "readMessage", "login": login,
+                                                       "domain": domain, "id": str(msg_id)},
+                                               headers={"Accept": "application/json"},
+                                               timeout=15, use_proxy=True)
+                    detail_data = _safe_data(detail_resp)
+                    if isinstance(detail_data, dict):
+                        body = detail_data.get("textBody", "") or detail_data.get("htmlBody", "")
+                        body_code = _find_code(body)
+                        if body_code:
+                            return body_code
+                except Exception:
+                    pass
+
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: 已轮询{poll_count}次未收到验证码")
+            time.sleep(3)
+        except Exception as e:
+            time.sleep(5)
+            if poll_count > 20:
+                raise RuntimeError(f"收取验证码超时: {e}")
+
+
+def fetch_verification_code(token, base_url=None, stop_check=None, provider_type=None):
+    if provider_type == "guerrilla":
+        return _fetch_code_guerrilla(token, stop_check=stop_check)
+
+    if provider_type == "tempmailio":
+        return _fetch_code_tempmailio(token, stop_check=stop_check)
+
+    if provider_type == "1secmail":
+        return _fetch_code_1secmail(token, stop_check=stop_check)
+
+    if base_url is None:
+        base_url = _MAILTM_PROVIDERS[0]
+    return _fetch_code_mailtm(token, base_url, stop_check=stop_check)
