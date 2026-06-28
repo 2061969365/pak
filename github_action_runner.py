@@ -75,7 +75,7 @@ def _get_current_warp_ip():
     return None
 
 def _rotate_warp_ip():
-    """Disconnect and reconnect WARP until IP actually changes"""
+    """Try to rotate WARP IP. If unchanged after 5 tries, proceed anyway."""
     import subprocess
     old_ip = _get_current_warp_ip()
     print('  Current IP: ' + (old_ip or 'unknown'))
@@ -91,11 +91,11 @@ def _rotate_warp_ip():
 
         new_ip = _get_current_warp_ip()
         if new_ip and new_ip != old_ip:
-            print('IP changed: ' + old_ip + ' -> ' + new_ip)
+            print('IP changed: ' + (old_ip or '?') + ' -> ' + new_ip)
             return True
-        print('same IP, retrying...')
+        print('same IP')
 
-    print('  WARNING: Could not change IP after 5 attempts')
+    print('  IP unchanged after 5 tries, proceeding with same IP')
     return False
 
 
